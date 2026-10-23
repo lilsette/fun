@@ -496,7 +496,7 @@ let last = t0, lastStep = -1, lastMinute = -1;
 const hand = { leftX: keyX(5), rightX: keyX(12), prevL: keyX(5), prevR: keyX(12), bassStep: 0 };
 
 function frame(now) {
-  const t = now - t0;
+  const t = Math.max(0, now - t0);
   const dt = Math.min(0.05, (now - last) / 1000); last = now;
   const dayT = ((t + START_HOUR / 24 * DAY_MS) % DAY_MS) / DAY_MS;
   const hour = dayT * 24;
