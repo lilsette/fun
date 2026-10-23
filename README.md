@@ -1,5 +1,14 @@
-# Synth Day
+# Fun
 
-A 60-second screensaver: one full 24-hour day (sunrise, noon, sunset, moonlit night) on a loop, with an old man in a Tron suit playing a synth.
+A gallery of looping browser screensavers.
 
-Open `index.html` in a browser. Click for sound, press F for fullscreen.
+Open `index.html` to browse them, or open a screensaver directly from `screensavers/`.
+
+## Screensavers
+
+- **Synth Day** (`screensavers/synth-day/`): one full 24-hour day in 60 seconds, with sunrise, sunset and a moonlit night, while an old man in a Tron suit plays a synth. Click for sound, press F for fullscreen.
+
+## Adding one
+
+1. Create `screensavers/<name>/index.html`.
+2. Add an entry to the `SCREENSAVERS` list in `index.html`.

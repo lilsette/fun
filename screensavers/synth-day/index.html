@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Synth Day</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05030f; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  body.idle { cursor: none; }
+  #hud {
+    position: fixed; left: 24px; top: 20px; pointer-events: none;
+    font: 600 13px/1.4 "Courier New", monospace; letter-spacing: 3px;
+    color: #9ff8ff; text-shadow: 0 0 8px #00e5ff, 0 0 2px #00e5ff;
+  }
+  #hud .time { font-size: 34px; letter-spacing: 4px; }
+  #hint {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    font: 12px "Courier New", monospace; letter-spacing: 2px; color: #fff;
+    opacity: .75; transition: opacity 1s; pointer-events: none;
+    text-shadow: 0 0 6px #000; white-space: nowrap;
+  }
+  body.idle #hint { opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><div class="time" id="clock">04:00</div><div id="phase">NIGHT</div></div>
+<div id="hint">CLICK FOR SOUND · F FOR FULLSCREEN</div>
+<script>
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const clockEl = document.getElementById('clock');
+const phaseEl = document.getElementById('phase');
+const hintEl = document.getElementById('hint');
+
+const DAY_MS = 60000;        // one full 24h day in 60 seconds
+const START_HOUR = 4;        // open just before dawn
+const STEP_MS = 250;         // sequencer step (16ths at 60bpm-ish feel)
+
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const hex = h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+const mix = (c1, c2, t) => c1.map((v, i) => Math.round(lerp(v, c2[i], t)));
+const rgb = (c, a = 1) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+const smooth = t => t * t * (3 - 2 * t);
+
+// ---------- sky keyframes: [hour, top, horizon] ----------
+const SKY = [
+  [0,    '#03020c', '#120828'],
+  [4.5,  '#050318', '#1a0d38'],
+  [5.4,  '#1d1450', '#6a2c6e'],
+  [6.0,  '#34307a', '#ff6a6a'],
+  [6.8,  '#4a72c4', '#ffb870'],
+  [8.0,  '#3a88de', '#b0dcff'],
+  [12,   '#2a7ae0', '#a4d6ff'],
+  [16,   '#3a7cd4', '#b8dcff'],
+  [17.3, '#5a56a8', '#ffa060'],
+  [18.0, '#3a2468', '#ff5a72'],
+  [18.7, '#1a0f44', '#7a2a6a'],
+  [19.6, '#07041a', '#22103e'],
+  [24,   '#03020c', '#120828'],
+].map(([h, a, b]) => [h, hex(a), hex(b)]);
+
+function skyAt(hour) {
+  for (let i = 0; i < SKY.length - 1; i++) {
+    const [h0, a0, b0] = SKY[i], [h1, a1, b1] = SKY[i + 1];
+    if (hour >= h0 && hour <= h1) {
+      const t = smooth((hour - h0) / (h1 - h0));
+      return [mix(a0, a1, t), mix(b0, b1, t)];
+    }
+  }
+  return [SKY[0][1], SKY[0][2]];
+}
+
+// ---------- scene setup ----------
+let W, H, horizon, stars = [], ridges = [], clouds = [], notes = [], shooting = null;
+
+function ridge(base, amp, n) {
+  const f = Array.from({ length: n }, () => [Math.random() * 0.012 + 0.002, Math.random() * Math.PI * 2, Math.random()]);
+  const pts = [];
+  for (let x = -10; x <= W + 10; x += 6) {
+    let y = 0;
+    f.forEach(([fr, ph, w]) => { y += Math.sin(x * fr + ph) * w; });
+    pts.push([x, base - Math.abs(y) * amp / n * 1.6]);
+  }
+  return pts;
+}
+
+function makeScene() {
+  horizon = H * 0.66;
+  stars = Array.from({ length: Math.round(W * H / 3500) }, () => ({
+    x: Math.random() * W, y: Math.random() * horizon * 0.95,
+    r: Math.random() * 1.3 + 0.2, tw: Math.random() * 3 + 1, ph: Math.random() * 6.28,
+  }));
+  ridges = [
+    { pts: ridge(horizon, H * 0.22, 4), day: hex('#8aa0cc'), night: hex('#1c1446') },
+    { pts: ridge(horizon, H * 0.14, 5), day: hex('#5a74a4'), night: hex('#130c34') },
+    { pts: ridge(horizon, H * 0.07, 6), day: hex('#33476c'), night: hex('#0b0724') },
+  ];
+  clouds = Array.from({ length: 6 }, (_, i) => ({
+    x: Math.random() * W, y: H * (0.08 + Math.random() * 0.3),
+    s: 0.6 + Math.random() * 0.9, v: 8 + Math.random() * 14,
+  }));
+}
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  makeScene();
+}
+addEventListener('resize', resize);
+resize();
+
+// ---------- music: A minor-ish progression on white keys ----------
+// white-key index 0 = C2 on a 22-key keyboard
+const DEG = [0, 2, 4, 5, 7, 9, 11];
+const keyFreq = i => 440 * Math.pow(2, (36 + 12 * Math.floor(i / 7) + DEG[i % 7] - 69) / 12);
+const CHORDS = [
+  { bass: 5, arp: [12, 14, 16, 19] }, // Am
+  { bass: 3, arp: [10, 12, 14, 17] }, // F
+  { bass: 0, arp: [14, 16, 18, 21] }, // C
+  { bass: 4, arp: [11, 13, 15, 18] }, // G
+];
+const ARP = [0, 1, 2, 3, 2, 1, 2, 3, 0, 2, 1, 3, 2, 3, 1, 2];
+
+let actx = null, master, delayNode, soundOn = false;
+function initAudio() {
+  actx = new (window.AudioContext || window.webkitAudioContext)();
+  master = actx.createGain(); master.gain.value = 0.2;
+  delayNode = actx.createDelay(); delayNode.delayTime.value = 0.375;
+  const fb = actx.createGain(); fb.gain.value = 0.35;
+  const wet = actx.createGain(); wet.gain.value = 0.35;
+  delayNode.connect(fb); fb.connect(delayNode);
+  delayNode.connect(wet); wet.connect(master);
+  master.connect(actx.destination);
+}
+function voice(freq, dur, type, vol, cut) {
+  const t = actx.currentTime;
+  const o = actx.createOscillator(), f = actx.createBiquadFilter(), g = actx.createGain();
+  o.type = type; o.frequency.value = freq;
+  f.type = 'lowpass'; f.Q.value = 7;
+  f.frequency.setValueAtTime(cut, t);
+  f.frequency.exponentialRampToValueAtTime(Math.max(180, cut * 0.25), t + dur);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(f); f.connect(g); g.connect(master); g.connect(delayNode);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+
+addEventListener('click', () => {
+  if (!actx) initAudio();
+  soundOn = !soundOn;
+  soundOn ? actx.resume() : actx.suspend();
+  hintEl.textContent = (soundOn ? 'CLICK TO MUTE' : 'CLICK FOR SOUND') + ' · F FOR FULLSCREEN';
+});
+addEventListener('keydown', e => {
+  if (e.key === 'f' || e.key === 'F') {
+    document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.();
+  }
+});
+let idleTimer;
+function wake() {
+  document.body.classList.remove('idle');
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => document.body.classList.add('idle'), 2500);
+}
+addEventListener('mousemove', wake); wake();
+
+// ---------- drawing ----------
+function drawSky(hour, night, t) {
+  const [top, bot] = skyAt(hour);
+  const g = ctx.createLinearGradient(0, 0, 0, horizon);
+  g.addColorStop(0, rgb(top)); g.addColorStop(1, rgb(bot));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, horizon + 2);
+
+  if (night > 0.01) {
+    for (const s of stars) {
+      const a = night * (0.55 + 0.45 * Math.sin(t / 1000 * s.tw + s.ph));
+      ctx.fillStyle = `rgba(255,255,255,${a})`;
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 6.283); ctx.fill();
+    }
+    if (!shooting && night > 0.8 && Math.random() < 0.006) {
+      shooting = { x: Math.random() * W * 0.7 + W * 0.15, y: Math.random() * horizon * 0.4, vx: -6 - Math.random() * 4, vy: 3 + Math.random() * 2, life: 1 };
+    }
+  }
+  if (shooting) {
+    const s = shooting;
+    ctx.strokeStyle = `rgba(200,250,255,${s.life * night})`; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(s.x - s.vx * 10, s.y - s.vy * 10); ctx.stroke();
+    s.x += s.vx; s.y += s.vy; s.life -= 0.025;
+    if (s.life <= 0) shooting = null;
+  }
+}
+
+function drawSunMoon(hour, el) {
+  const rx = W * 0.46, ry = H * 0.52;
+  // sun
+  const a = (hour - 6) / 12 * Math.PI;
+  if (el > -0.15) {
+    const x = W / 2 - Math.cos(a) * rx, y = horizon - Math.sin(a) * ry;
+    const r = Math.min(W, H) * 0.055;
+    const col = mix(hex('#ff4a3c'), hex('#fff6c8'), clamp(el / 0.45, 0, 1));
+    const glow = ctx.createRadialGradient(x, y, r * 0.5, x, y, r * 6);
+    glow.addColorStop(0, rgb(col, 0.55)); glow.addColorStop(1, rgb(col, 0));
+    ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(x, y, r * 6, 0, 6.283); ctx.fill();
+    ctx.fillStyle = rgb(col); ctx.beginPath(); ctx.arc(x, y, r, 0, 6.283); ctx.fill();
+  }
+  // moon, opposite side of the sky
+  const am = ((hour - 18 + 24) % 24) / 12 * Math.PI;
+  if (Math.sin(am) > -0.15) {
+    const x = W / 2 - Math.cos(am) * rx, y = horizon - Math.sin(am) * ry * 0.9;
+    const r = Math.min(W, H) * 0.035;
+    const glow = ctx.createRadialGradient(x, y, r, x, y, r * 4);
+    glow.addColorStop(0, 'rgba(190,220,255,.25)'); glow.addColorStop(1, 'rgba(190,220,255,0)');
+    ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(x, y, r * 4, 0, 6.283); ctx.fill();
+    ctx.fillStyle = '#e8eefc'; ctx.beginPath(); ctx.arc(x, y, r, 0, 6.283); ctx.fill();
+    ctx.fillStyle = 'rgba(150,160,190,.45)';
+    [[-0.3, -0.2, 0.22], [0.25, 0.15, 0.16], [-0.05, 0.4, 0.12]].forEach(([cx, cy, cr]) => {
+      ctx.beginPath(); ctx.arc(x + cx * r, y + cy * r, cr * r, 0, 6.283); ctx.fill();
+    });
+  }
+}
+
+function drawClouds(day, golden, dt) {
+  if (day < 0.02) return;
+  const col = mix(hex('#ffffff'), hex('#ffa2a0'), golden);
+  for (const c of clouds) {
+    c.x += c.v * dt; if (c.x > W + 200) c.x = -200;
+    ctx.fillStyle = rgb(col, 0.75 * day);
+    const s = c.s * Math.min(W, H) / 900;
+    [[0, 0, 40], [38, 8, 32], [-36, 10, 30], [10, -18, 30], [70, 16, 22], [-66, 18, 20]].forEach(([dx, dy, r]) => {
+      ctx.beginPath(); ctx.arc(c.x + dx * s, c.y + dy * s, r * s, 0, 6.283); ctx.fill();
+    });
+  }
+}
+
+function drawMountains(day, golden) {
+  const warm = hex('#c8607a');
+  ridges.forEach((rg, i) => {
+    let c = mix(rg.night, rg.day, day);
+    c = mix(c, warm, golden * (0.35 - i * 0.1));
+    ctx.fillStyle = rgb(c);
+    ctx.beginPath(); ctx.moveTo(-10, horizon + 1);
+    rg.pts.forEach(([x, y]) => ctx.lineTo(x, y));
+    ctx.lineTo(W + 10, horizon + 1); ctx.closePath(); ctx.fill();
+  });
+}
+
+function drawGround(night, t) {
+  const g = ctx.createLinearGradient(0, horizon, 0, H);
+  g.addColorStop(0, rgb(mix(hex('#2b3060'), hex('#0c0526'), night)));
+  g.addColorStop(1, rgb(mix(hex('#151936'), hex('#030109'), night)));
+  ctx.fillStyle = g; ctx.fillRect(0, horizon, W, H - horizon);
+
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, horizon, W, H - horizon); ctx.clip();
+  const a = 0.25 + 0.6 * night;
+  ctx.strokeStyle = `rgba(255,50,220,${a})`;
+  ctx.shadowColor = '#ff2bd6'; ctx.shadowBlur = 10 * night;
+  ctx.lineWidth = 1.3;
+  const scroll = (t / 1000 * 0.6) % 1;
+  ctx.beginPath();
+  for (let i = 1; i < 40; i++) {
+    const z = i + 1 - scroll;
+    const y = horizon + (H - horizon) * 1.6 / z;
+    if (y > H + 2) continue;
+    ctx.moveTo(0, y); ctx.lineTo(W, y);
+  }
+  for (let j = -24; j <= 24; j++) {
+    ctx.moveTo(W / 2 + j * W * 0.01, horizon);
+    ctx.lineTo(W / 2 + j * W * 0.11, H);
+  }
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.fillStyle = `rgba(0,240,255,${0.3 + 0.6 * night})`;
+  ctx.shadowColor = '#00f0ff'; ctx.shadowBlur = 14 * night;
+  ctx.fillRect(0, horizon - 1, W, 2);
+  ctx.shadowBlur = 0;
+}
+
+// key geometry on the synth (local figure units)
+const NKEYS = 22, KB = { by: -162, fy: -144, bx: 140, fx: 150 };
+const keyX = (i, depth = 0.5) => {
+  const half = lerp(KB.bx, KB.fx, depth);
+  return lerp(-half, half, (i + 0.5) / NKEYS);
+};
+
+function neon(color, blur) { ctx.strokeStyle = color; ctx.shadowColor = color; ctx.shadowBlur = blur; }
+
+function drawPlayer(t, night, state) {
+  const s = Math.min(H / 700, W / 480);
+  const gx = W / 2, gy = H * 0.93;
+  const glow = 8 + 14 * night;
+  const SUIT = '#0c111f', CYAN = '#2ef6ff', PINK = '#ff2bd6';
+  const skin = rgb(mix(hex('#f0c09a'), hex('#9b7a90'), night * 0.6));
+  const beard = rgb(mix(hex('#f4f4f4'), hex('#c8c8e0'), night * 0.5));
+
+  ctx.save();
+  ctx.translate(gx, gy); ctx.scale(s, s);
+
+  // floor glow + shadow
+  const fg = ctx.createRadialGradient(0, 0, 10, 0, 0, 220);
+  fg.addColorStop(0, `rgba(46,246,255,${0.15 + 0.25 * night})`); fg.addColorStop(1, 'rgba(46,246,255,0)');
+  ctx.fillStyle = fg; ctx.beginPath(); ctx.ellipse(0, 0, 220, 34, 0, 0, 6.283); ctx.fill();
+
+  const beat = (t / 500) % 1;
+  const bob = Math.pow(1 - beat, 3) * 5;
+  const sway = Math.sin(t / 1000 * Math.PI) * 3;
+
+  // legs
+  ctx.fillStyle = SUIT;
+  [-1, 1].forEach(side => {
+    ctx.beginPath(); ctx.roundRect(side * 20 - 12, -122, 24, 116, 8); ctx.fill();
+    ctx.beginPath(); ctx.roundRect(side * 20 - 16 + side * 3, -10, 32, 12, 5); ctx.fill();
+  });
+  ctx.lineWidth = 2.5; neon(CYAN, glow);
+  ctx.beginPath();
+  [-1, 1].forEach(side => {
+    ctx.moveTo(side * 30, -118); ctx.lineTo(side * 30, -12);
+    ctx.moveTo(side * 20 - 14 + side * 3, 1); ctx.lineTo(side * 20 + 14 + side * 3, 1);
+  });
+  ctx.stroke(); ctx.shadowBlur = 0;
+
+  ctx.save(); ctx.translate(sway, 0);
+  // torso with an older-gentleman belly
+  ctx.fillStyle = SUIT;
+  ctx.beginPath();
+  ctx.moveTo(-46, -246);
+  ctx.quadraticCurveTo(0, -258, 46, -246);
+  ctx.quadraticCurveTo(54, -200, 60, -160);
+  ctx.quadraticCurveTo(64, -124, 40, -110);
+  ctx.lineTo(-40, -110);
+  ctx.quadraticCurveTo(-64, -124, -60, -160);
+  ctx.quadraticCurveTo(-54, -200, -46, -246);
+  ctx.fill();
+  ctx.lineWidth = 2.5; neon(CYAN, glow);
+  ctx.beginPath();
+  ctx.moveTo(-28, -248); ctx.quadraticCurveTo(-44, -180, -36, -114);
+  ctx.moveTo(28, -248); ctx.quadraticCurveTo(44, -180, 36, -114);
+  ctx.moveTo(-14, -252); ctx.lineTo(0, -238); ctx.lineTo(14, -252);
+  ctx.stroke();
+  ctx.beginPath(); ctx.arc(0, -212, 11, 0, 6.283); ctx.stroke();
+  ctx.beginPath(); ctx.arc(0, -212, 4, 0, 6.283); ctx.fillStyle = CYAN; ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // neck + head
+  ctx.save(); ctx.translate(0, bob); ctx.rotate(Math.sin(t / 1000 * Math.PI) * 0.04);
+  ctx.fillStyle = skin; ctx.fillRect(-11, -268, 22, 20);
+  // ears
+  ctx.beginPath(); ctx.ellipse(-37, -300, 7, 11, 0, 0, 6.283); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(37, -300, 7, 11, 0, 0, 6.283); ctx.fill();
+  // head
+  ctx.beginPath(); ctx.ellipse(0, -304, 35, 40, 0, 0, 6.283); ctx.fill();
+  // bald shine
+  ctx.fillStyle = 'rgba(255,255,255,.35)';
+  ctx.beginPath(); ctx.ellipse(-11, -330, 11, 6, -0.4, 0, 6.283); ctx.fill();
+  // white hair fringe on the sides
+  ctx.fillStyle = beard;
+  [-1, 1].forEach(sd => {
+    ctx.beginPath();
+    ctx.moveTo(sd * 30, -322);
+    ctx.quadraticCurveTo(sd * 46, -312, sd * 40, -286);
+    ctx.quadraticCurveTo(sd * 34, -300, sd * 33, -312);
+    ctx.fill();
+  });
+  // beard + moustache
+  ctx.beginPath();
+  ctx.moveTo(-33, -298);
+  ctx.quadraticCurveTo(-36, -258, 0, -246);
+  ctx.quadraticCurveTo(36, -258, 33, -298);
+  ctx.quadraticCurveTo(22, -280, 0, -282);
+  ctx.quadraticCurveTo(-22, -280, -33, -298);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(-16, -284); ctx.quadraticCurveTo(0, -292, 16, -284);
+  ctx.quadraticCurveTo(0, -280, -16, -284); ctx.fill();
+  ctx.lineWidth = 6; ctx.strokeStyle = beard; ctx.stroke();
+  // smile
+  ctx.strokeStyle = '#7a3b3b'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(0, -282, 7, 0.25, Math.PI - 0.25); ctx.stroke();
+  // nose
+  ctx.fillStyle = rgb(mix(hex('#e0a07a'), hex('#8a6a80'), night * 0.6));
+  ctx.beginPath(); ctx.ellipse(0, -296, 5, 7, 0, 0, 6.283); ctx.fill();
+  // bushy brows
+  ctx.strokeStyle = beard; ctx.lineWidth = 5; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(-24, -318); ctx.lineTo(-8, -316); ctx.moveTo(8, -316); ctx.lineTo(24, -318); ctx.stroke();
+  // neon visor glasses
+  ctx.fillStyle = 'rgba(10,20,40,.85)';
+  ctx.beginPath(); ctx.roundRect(-27, -312, 23, 13, 4); ctx.roundRect(4, -312, 23, 13, 4); ctx.fill();
+  ctx.lineWidth = 2; neon(CYAN, glow);
+  ctx.beginPath(); ctx.roundRect(-27, -312, 23, 13, 4); ctx.roundRect(4, -312, 23, 13, 4);
+  ctx.moveTo(-4, -306); ctx.lineTo(4, -306); ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.restore(); // head
+  ctx.restore(); // sway
+
+  // keyboard stand
+  ctx.strokeStyle = '#3a3f55'; ctx.lineWidth = 7; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(-110, -2); ctx.lineTo(90, -128); ctx.moveTo(110, -2); ctx.lineTo(-90, -128); ctx.stroke();
+
+  // synth body
+  ctx.fillStyle = '#141726';
+  ctx.beginPath(); ctx.moveTo(-138, -180); ctx.lineTo(138, -180); ctx.lineTo(KB.bx, KB.by); ctx.lineTo(-KB.bx, KB.by); ctx.fill();
+  ctx.fillStyle = '#1b1f33';
+  ctx.beginPath(); ctx.roundRect(-152, -146, 304, 24, 4); ctx.fill();
+  // knobs + tiny screen
+  for (let k = 0; k < 6; k++) {
+    ctx.fillStyle = '#2a2f48'; ctx.beginPath(); ctx.arc(-118 + k * 18, -171, 5.5, 0, 6.283); ctx.fill();
+    ctx.strokeStyle = PINK; ctx.lineWidth = 1.5; ctx.beginPath();
+    const ang = -2.2 + ((Math.sin(t / 900 + k) + 1) / 2) * 4.4;
+    ctx.moveTo(-118 + k * 18, -171); ctx.lineTo(-118 + k * 18 + Math.cos(ang) * 5, -171 + Math.sin(ang) * 5); ctx.stroke();
+  }
+  ctx.fillStyle = '#04121a'; ctx.fillRect(10, -177, 70, 12);
+  ctx.lineWidth = 1.2; neon(CYAN, 6);
+  ctx.beginPath();
+  for (let x = 0; x <= 66; x += 2) ctx.lineTo(12 + x, -171 + Math.sin(x * 0.35 + t / 120) * 4 * (1 - beat * 0.6));
+  ctx.stroke(); ctx.shadowBlur = 0;
+  for (let k = 0; k < 3; k++) {
+    ctx.fillStyle = (state.step >> k) & 1 ? PINK : '#3a1838';
+    ctx.beginPath(); ctx.arc(96 + k * 12, -171, 3, 0, 6.283); ctx.fill();
+  }
+
+  // keys
+  for (let i = 0; i < NKEYS; i++) {
+    const b0 = lerp(-KB.bx, KB.bx, i / NKEYS), b1 = lerp(-KB.bx, KB.bx, (i + 1) / NKEYS);
+    const f0 = lerp(-KB.fx, KB.fx, i / NKEYS), f1 = lerp(-KB.fx, KB.fx, (i + 1) / NKEYS);
+    let fill = '#eef0f6';
+    if (i === state.arpKey) fill = rgb(mix(hex('#ff2bd6'), hex('#eef0f6'), state.frac));
+    if (i === state.bassKey) fill = rgb(mix(hex('#2ef6ff'), hex('#eef0f6'), state.bassFrac * 0.7));
+    ctx.fillStyle = fill;
+    ctx.beginPath(); ctx.moveTo(b0 + 0.6, KB.by); ctx.lineTo(b1 - 0.6, KB.by); ctx.lineTo(f1 - 0.6, KB.fy); ctx.lineTo(f0 + 0.6, KB.fy); ctx.fill();
+  }
+  ctx.fillStyle = '#0a0b12';
+  for (let i = 0; i < NKEYS - 1; i++) {
+    if (![0, 1, 3, 4, 5].includes(i % 7)) continue;
+    const bx = lerp(-KB.bx, KB.bx, (i + 1) / NKEYS), w = (2 * KB.bx / NKEYS) * 0.32;
+    ctx.fillRect(bx - w, KB.by, w * 2, (KB.fy - KB.by) * 0.55);
+  }
+  ctx.lineWidth = 2.5; neon(PINK, glow);
+  ctx.beginPath(); ctx.moveTo(-150, -140); ctx.lineTo(150, -140); ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // arms reaching to the keys
+  const hands = [
+    { sx: -46 + sway, sy: -238, hx: state.leftX, hy: -154 - state.leftLift, side: -1 },
+    { sx: 46 + sway, sy: -238, hx: state.rightX, hy: -154 - state.rightLift, side: 1 },
+  ];
+  hands.forEach(h => {
+    const cx = h.sx + (h.hx - h.sx) * 0.25 + h.side * 30, cy = (h.sy + h.hy) / 2 + 28;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = SUIT; ctx.lineWidth = 22;
+    ctx.beginPath(); ctx.moveTo(h.sx, h.sy); ctx.quadraticCurveTo(cx, cy, h.hx, h.hy - 8); ctx.stroke();
+    ctx.lineWidth = 2.5; neon(CYAN, glow);
+    ctx.beginPath(); ctx.moveTo(h.sx + h.side * 6, h.sy); ctx.quadraticCurveTo(cx + h.side * 9, cy + 6, h.hx + h.side * 7, h.hy - 10); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = skin;
+    ctx.beginPath(); ctx.ellipse(h.hx, h.hy, 11, 8, 0, 0, 6.283); ctx.fill();
+  });
+
+  ctx.restore();
+  return { gx, gy, s };
+}
+
+function drawNotes(dt) {
+  ctx.textAlign = 'center';
+  for (let i = notes.length - 1; i >= 0; i--) {
+    const n = notes[i];
+    n.life -= dt * 0.35; n.y -= n.vy * dt; n.x += Math.sin(n.life * 6 + n.ph) * 0.6;
+    if (n.life <= 0) { notes.splice(i, 1); continue; }
+    ctx.font = `${n.size}px serif`;
+    ctx.fillStyle = n.col; ctx.shadowColor = n.col; ctx.shadowBlur = 12;
+    ctx.globalAlpha = Math.min(1, n.life * 1.5);
+    ctx.fillText(n.ch, n.x, n.y);
+  }
+  ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+}
+
+function phaseName(hour) {
+  if (hour >= 5 && hour < 7) return 'SUNRISE';
+  if (hour >= 7 && hour < 11.5) return 'MORNING';
+  if (hour >= 11.5 && hour < 13) return 'NOON';
+  if (hour >= 13 && hour < 17) return 'AFTERNOON';
+  if (hour >= 17 && hour < 19) return 'SUNSET';
+  if (hour >= 19 && hour < 22) return 'EVENING';
+  return 'NIGHT';
+}
+
+// ---------- main loop ----------
+const t0 = performance.now();
+let last = t0, lastStep = -1, lastMinute = -1;
+const hand = { leftX: keyX(5), rightX: keyX(12), prevL: keyX(5), prevR: keyX(12), bassStep: 0 };
+
+function frame(now) {
+  const t = now - t0;
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  const dayT = ((t + START_HOUR / 24 * DAY_MS) % DAY_MS) / DAY_MS;
+  const hour = dayT * 24;
+  const el = Math.sin((hour - 6) / 12 * Math.PI);          // sun elevation -1..1
+  const day = clamp((el + 0.1) / 0.35, 0, 1);
+  const night = 1 - day;
+  const golden = clamp(1 - Math.abs(el) / 0.3, 0, 1);
+
+  // sequencer
+  const step = Math.floor(t / STEP_MS);
+  const frac = (t % STEP_MS) / STEP_MS;
+  const chord = CHORDS[Math.floor(step / 16) % CHORDS.length];
+  const arpKey = chord.arp[ARP[step % 16]];
+  if (step !== lastStep) {
+    lastStep = step;
+    hand.prevR = hand.rightX;
+    if (step % 4 === 0) { hand.prevL = hand.leftX; hand.bassStep = step; }
+    if (soundOn && actx) {
+      const cut = 900 + 3200 * day + 800 * golden;
+      voice(keyFreq(arpKey), 0.3, 'sawtooth', 0.22, cut);
+      if (step % 4 === 0) voice(keyFreq(chord.bass), 0.9, 'square', 0.18, 600 + 600 * day);
+    }
+    if (Math.random() < 0.35) {
+      const sc = Math.min(H / 700, W / 480);
+      notes.push({
+        x: W / 2 + keyX(arpKey) * sc, y: H * 0.93 - 190 * sc,
+        vy: 40 + Math.random() * 30, life: 1, ph: Math.random() * 6,
+        size: 18 + Math.random() * 14, ch: Math.random() < 0.5 ? '♪' : '♫',
+        col: ['#2ef6ff', '#ff2bd6', '#ffe66b'][Math.floor(Math.random() * 3)],
+      });
+    }
+  }
+  const bassFrac = clamp((t - hand.bassStep * STEP_MS) / (STEP_MS * 4), 0, 1);
+  hand.rightX = lerp(hand.prevR, keyX(arpKey), clamp(frac * 5, 0, 1));
+  hand.leftX = lerp(hand.prevL, keyX(chord.bass), clamp(bassFrac * 8, 0, 1));
+
+  drawSky(hour, night, t);
+  drawSunMoon(hour, el);
+  drawClouds(day, golden, dt);
+  drawMountains(day, golden);
+  drawGround(night, t);
+  drawPlayer(t, night, {
+    step, frac, arpKey, bassKey: chord.bass, bassFrac,
+    leftX: hand.leftX, rightX: hand.rightX,
+    leftLift: Math.sin(bassFrac * Math.PI) * 3,
+    rightLift: Math.sin(frac * Math.PI) * 5,
+  });
+  drawNotes(dt);
+
+  // soft vignette
+  const v = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.75);
+  v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(0,0,0,.45)');
+  ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+
+  const minute = Math.floor(hour * 60);
+  if (minute !== lastMinute) {
+    lastMinute = minute;
+    clockEl.textContent = String(Math.floor(hour)).padStart(2, '0') + ':' + String(minute % 60).padStart(2, '0');
+    phaseEl.textContent = phaseName(hour);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
