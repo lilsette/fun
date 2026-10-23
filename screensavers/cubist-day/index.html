@@ -7,6 +7,13 @@
 <style>
   html, body { margin: 0; height: 100%; background: #2a2238; overflow: hidden; }
   canvas { display: block; width: 100vw; height: 100vh; }
+  /* the paint texture and varnish sit over the animation and are blended by the browser */
+  #paint, #varnish { position: fixed; inset: 0; pointer-events: none; }
+  #paint { mix-blend-mode: overlay; opacity: .9; }
+  #varnish {
+    mix-blend-mode: multiply;
+    background: radial-gradient(ellipse at 50% 45%, rgb(255,250,236) 30%, rgb(150,118,92) 100%);
+  }
   body.idle { cursor: none; }
   #hud {
     position: fixed; left: 22px; top: 18px; pointer-events: none;
@@ -27,6 +34,8 @@
 </head>
 <body>
 <canvas id="c"></canvas>
+<canvas id="paint"></canvas>
+<div id="varnish"></div>
 <div id="hud"><div class="time" id="clock">04:00</div><div id="phase">night</div></div>
 <div id="hint">click for sound · F for fullscreen</div>
 <script>
@@ -73,7 +82,57 @@ function paletteAt(hour) {
 }
 
 // ---------- shard field: a jittered triangle mesh that breathes ----------
-let W, H, horizon, shards = [], grain, sunShape = [];
+let W, H, horizon, shards = [], sunShape = [];
+const paint = document.getElementById('paint');
+
+// small seeded random so each painted shape keeps the same brushwork every frame
+function rng(seed) {
+  return () => {
+    seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+// A gray canvas of brush strokes and weave, laid over the scene in overlay mode.
+function makePaintSurface() {
+  paint.width = W; paint.height = H;
+  const p = paint.getContext('2d');
+  p.fillStyle = '#808080'; p.fillRect(0, 0, W, H);
+  p.lineCap = 'round';
+  const n = Math.round(W * H / 110);
+  for (let i = 0; i < n; i++) {
+    const x = Math.random() * W, y = Math.random() * H;
+    // strokes follow a slow flow field, like a loaded brush moving across the canvas
+    const ang = Math.sin(x * 0.004) * 1.3 + Math.cos(y * 0.005) * 1.1 + (Math.random() - 0.5) * 0.5;
+    const len = 10 + Math.random() * 30, bend = (Math.random() - 0.5) * 0.6;
+    const v = Math.random() < 0.5 ? 255 : 0;
+    const bristles = Math.random() < 0.5 ? 3 : 1;
+    const w = 1 + Math.random() * 4;
+    for (let b = 0; b < bristles; b++) {
+      const off = (b - (bristles - 1) / 2) * w * 0.9;
+      const ox = -Math.sin(ang) * off, oy = Math.cos(ang) * off;
+      p.strokeStyle = `rgba(${v},${v},${v},${0.04 + Math.random() * 0.09})`;
+      p.lineWidth = bristles > 1 ? w * 0.6 : w;
+      p.beginPath();
+      p.moveTo(x + ox, y + oy);
+      p.quadraticCurveTo(x + ox + Math.cos(ang + bend) * len * 0.5, y + oy + Math.sin(ang + bend) * len * 0.5,
+                         x + ox + Math.cos(ang) * len, y + oy + Math.sin(ang) * len);
+      p.stroke();
+    }
+  }
+  // canvas weave
+  for (let y = 0; y < H; y += 3) { p.fillStyle = `rgba(0,0,0,${y % 6 ? 0.035 : 0.07})`; p.fillRect(0, y, W, 1); }
+  for (let x = 0; x < W; x += 3) { p.fillStyle = `rgba(255,255,255,${x % 6 ? 0.03 : 0.06})`; p.fillRect(x, 0, 1, H); }
+  // fine tooth
+  const id = p.getImageData(0, 0, W, H), d = id.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const k = (Math.random() - 0.5) * 26;
+    d[i] += k; d[i + 1] += k; d[i + 2] += k;
+  }
+  p.putImageData(id, 0, 0);
+}
 
 function makeScene() {
   horizon = H * 0.62;
@@ -95,18 +154,22 @@ function makeScene() {
     const a = pts[r][c], b = pts[r][c + 1], d = pts[r + 1][c], e = pts[r + 1][c + 1];
     const tris = Math.random() < 0.5 ? [[a, b, e], [a, e, d]] : [[a, b, d], [b, e, d]];
     for (const tri of tris) {
-      shards.push({ v: tri, ci: Math.floor(Math.random() * 4), hatch: Math.random() < 0.22, ang: Math.random() * Math.PI });
+      // each shard is painted with its own direction of strokes
+      const dabs = Array.from({ length: 7 }, () => {
+        let u = Math.random(), v = Math.random();
+        if (u + v > 1) { u = 1 - u; v = 1 - v; }
+        return {
+          u, v, len: 22 + Math.random() * 40, w: 6 + Math.random() * 12, da: (Math.random() - 0.5) * 0.5,
+          bend: (Math.random() - 0.5) * 0.5,
+          col: Math.random() < 0.5 ? `rgba(255,244,222,${0.07 + Math.random() * 0.14})` : `rgba(24,14,26,${0.07 + Math.random() * 0.14})`,
+        };
+      });
+      // long dashes with small gaps read as a dragged brush line rather than a ruled one
+      const dash = Array.from({ length: 6 }, (_, k) => k % 2 ? 2 + Math.random() * 5 : 30 + Math.random() * 70);
+      shards.push({ v: tri, ci: Math.floor(Math.random() * 4), hatch: Math.random() < 0.18, ang: Math.random() * Math.PI, dabs, dash });
     }
   }
-  // paper grain overlay
-  grain = document.createElement('canvas');
-  grain.width = grain.height = 160;
-  const g = grain.getContext('2d'), id = g.createImageData(160, 160);
-  for (let i = 0; i < id.data.length; i += 4) {
-    const v = Math.random() * 255;
-    id.data[i] = id.data[i + 1] = id.data[i + 2] = v; id.data[i + 3] = 22;
-  }
-  g.putImageData(id, 0, 0);
+  makePaintSurface();
   sunShape = Array.from({ length: 9 }, (_, i) => [i / 9 * Math.PI * 2, 0.8 + Math.random() * 0.35]);
 }
 
@@ -187,10 +250,53 @@ function path(pts, wob = 0) {
   });
   ctx.closePath();
 }
-function poly(pts, fill, { wob = 1, ink = true } = {}) {
+const CREAM = [255, 244, 222], SHADE = [40, 24, 34];
+
+// One loaded-brush stroke: a few bristle lines, slightly curved, thinning at the tail.
+function brushStroke(x, y, a, len, w, col, bend) {
+  const c = Math.cos(a), s = Math.sin(a), nx = -s, ny = c;
+  const hx = c * len / 2, hy = s * len / 2;
+  const mx = x + nx * len * bend * 0.3, my = y + ny * len * bend * 0.3;
+  ctx.strokeStyle = col;
+  for (let b = -1; b <= 1; b++) {
+    const o = b * w * 0.32;
+    ctx.lineWidth = w * (b ? 0.3 : 0.42);
+    ctx.beginPath();
+    ctx.moveTo(x - hx + nx * o, y - hy + ny * o);
+    ctx.quadraticCurveTo(mx + nx * o, my + ny * o, x + hx + nx * o * 0.4, y + hy + ny * o * 0.4);
+    ctx.stroke();
+  }
+}
+
+function poly(pts, fill, { wob = 1, ink = true, paint = true } = {}) {
   path(pts, wob);
   ctx.fillStyle = fill; ctx.fill();
-  if (ink) { ctx.strokeStyle = INK; ctx.stroke(); }
+  if (paint) brushwork(pts);
+  if (ink) {
+    // a firm line with a soft bleed around it, like ink on wet paint
+    path(pts, wob);
+    const lw = ctx.lineWidth;
+    ctx.strokeStyle = INK; ctx.stroke();
+    ctx.globalAlpha = 0.18; ctx.lineWidth = lw * 2.4; ctx.stroke();
+    ctx.globalAlpha = 1; ctx.lineWidth = lw;
+  }
+}
+// a few light and dark strokes across a shape, clipped to its current path
+function brushwork(pts) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const [x, y] of pts) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+  const r = rng(Math.round(pts[0][0] * 31 + pts[0][1] * 17 + pts.length * 7));
+  const size = Math.min(x1 - x0, y1 - y0), ang = r() * Math.PI;
+  ctx.save(); ctx.clip();
+  ctx.lineCap = 'round';
+  const n = 3 + Math.floor(r() * 4);
+  for (let i = 0; i < n; i++) {
+    const cx = lerp(x0, x1, r()), cy = lerp(y0, y1, r());
+    const len = (x1 - x0 + y1 - y0) * 0.3 * (0.6 + r()), a = ang + (r() - 0.5) * 0.5;
+    const col = r() < 0.5 ? `rgba(255,244,222,${0.12 + r() * 0.16})` : `rgba(24,14,26,${0.12 + r() * 0.16})`;
+    brushStroke(cx, cy, a, len, Math.max(2, size * (0.2 + r() * 0.25)), col, (r() - 0.5) * 0.5);
+  }
+  ctx.restore();
 }
 function limb(a, b, w, fill) {
   const dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy) || 1;
@@ -204,20 +310,33 @@ function drawShards(pal, t) {
     const p = s.v.map(v => [v.x + Math.sin(t / 2200 + v.ph) * v.amp, v.y + Math.cos(t / 2600 + v.ph) * v.amp]);
     const cy = (p[0][1] + p[1][1] + p[2][1]) / 3;
     const set = cy < horizon ? pal.sky : pal.ground;
+    const base = set[s.ci];
+    const g = ctx.createLinearGradient(p[0][0], p[0][1], (p[1][0] + p[2][0]) / 2, (p[1][1] + p[2][1]) / 2);
+    g.addColorStop(0, rgb(mix(base, CREAM, 0.14)));
+    g.addColorStop(1, rgb(mix(base, SHADE, 0.16)));
     path(p);
-    ctx.fillStyle = rgb(set[s.ci]); ctx.fill();
-    if (s.hatch) {
-      ctx.save(); ctx.clip();
-      const cx = (p[0][0] + p[1][0] + p[2][0]) / 3;
-      ctx.translate(cx, cy); ctx.rotate(s.ang);
-      ctx.strokeStyle = 'rgba(28,20,14,.28)'; ctx.lineWidth = 1.2;
-      ctx.beginPath();
-      for (let k = -120; k <= 120; k += 7) { ctx.moveTo(k, -120); ctx.lineTo(k, 120); }
-      ctx.stroke();
-      ctx.restore();
+    ctx.fillStyle = g; ctx.fill();
+    ctx.save(); ctx.clip();
+    ctx.lineCap = 'round';
+    const ex = [p[1][0] - p[0][0], p[1][1] - p[0][1]], ey = [p[2][0] - p[0][0], p[2][1] - p[0][1]];
+    for (const d of s.dabs) {
+      const x = p[0][0] + d.u * ex[0] + d.v * ey[0], y = p[0][1] + d.u * ex[1] + d.v * ey[1];
+      brushStroke(x, y, s.ang + d.da, d.len, d.w, d.col, d.bend);
     }
+    if (s.hatch) {
+      // dry-brush hatching
+      const cx = (p[0][0] + p[1][0] + p[2][0]) / 3;
+      ctx.translate(cx, cy); ctx.rotate(s.ang + 0.8);
+      ctx.strokeStyle = 'rgba(28,20,14,.16)'; ctx.lineWidth = 2.6;
+      ctx.beginPath();
+      for (let k = -120; k <= 120; k += 10) { ctx.moveTo(k, -120); ctx.lineTo(k + 6, 120); }
+      ctx.stroke();
+    }
+    ctx.restore();
     path(p);
-    ctx.strokeStyle = 'rgba(28,20,14,.55)'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.strokeStyle = 'rgba(28,20,14,.12)'; ctx.lineWidth = 6; ctx.stroke();
+    ctx.setLineDash(s.dash); ctx.strokeStyle = 'rgba(28,20,14,.42)'; ctx.lineWidth = 2.2; ctx.stroke();
+    ctx.setLineDash([]);
   }
 }
 
@@ -288,7 +407,7 @@ function drawFigure(L, state) {
   ctx.lineWidth = 2.6; ctx.lineJoin = 'round';
 
   // floor shadow plane
-  poly([[-200, 4], [160, -6], [210, 14], [-170, 22]], 'rgba(28,20,14,.35)', { ink: false });
+  poly([[-200, 4], [160, -6], [210, 14], [-170, 22]], 'rgba(28,20,14,.35)', { ink: false, paint: false });
 
   // legs
   poly([[-34, -118], [-6, -118], [-10, -6], [-30, -6]], tone('#1a2440'));
@@ -344,7 +463,7 @@ function drawFigure(L, state) {
     if (i === state.arpKey) fill = rgb(mix(hex('#e0502a'), hex('#f2ead0'), state.frac));
     if (i === state.bassKey) fill = rgb(mix(hex('#3a6ab8'), hex('#f2ead0'), state.bassFrac * 0.7));
     ctx.lineWidth = 1.6;
-    poly([[lerp(KB.b0, KB.b1, u0), KB.by], [lerp(KB.b0, KB.b1, u1), KB.by], [lerp(KB.f0, KB.f1, u1), KB.fy], [lerp(KB.f0, KB.f1, u0), KB.fy]], fill, { wob: 0 });
+    poly([[lerp(KB.b0, KB.b1, u0), KB.by], [lerp(KB.b0, KB.b1, u1), KB.by], [lerp(KB.f0, KB.f1, u1), KB.fy], [lerp(KB.f0, KB.f1, u0), KB.fy]], fill, { wob: 0, paint: false });
   }
   for (let i = 0; i < NKEYS - 1; i++) {
     if (![0, 1, 3, 4, 5].includes(i % 7)) continue;
@@ -352,7 +471,7 @@ function drawFigure(L, state) {
     const bx0 = lerp(KB.b0, KB.b1, u - w), bx1 = lerp(KB.b0, KB.b1, u + w);
     const mid = 0.55, my = lerp(KB.by, KB.fy, mid);
     const mx0 = lerp(bx0, lerp(KB.f0, KB.f1, u - w), mid), mx1 = lerp(bx1, lerp(KB.f0, KB.f1, u + w), mid);
-    poly([[bx0, KB.by], [bx1, KB.by], [mx1, my], [mx0, my]], INK, { wob: 0, ink: false });
+    poly([[bx0, KB.by], [bx1, KB.by], [mx1, my], [mx0, my]], INK, { wob: 0, ink: false, paint: false });
   }
   ctx.lineWidth = 2.6;
 
@@ -482,8 +601,6 @@ function frame(now) {
   drawNeon(L, night);
   drawNotes(dt);
 
-  ctx.fillStyle = ctx.createPattern(grain, 'repeat');
-  ctx.fillRect(0, 0, W, H);
 
   const minute = Math.floor(hour * 60);
   if (minute !== lastMinute) {
